@@ -3,26 +3,26 @@ defmodule Geocoder.Worker do
   use Towel
 
   # Public API
-  def geocode(q, opts \\ []) do
-    assign(:geocode, q, opts)
+  def geocode(params) do
+    assign(:geocode, params)
   end
 
-  def geocode_list(q, opts \\ []) do
-    assign(:geocode_list, q, opts)
+  def geocode_list(params) do
+    assign(:geocode_list, params)
   end
 
-  def reverse_geocode(q, opts \\ []) do
-    assign(:reverse_geocode, q, opts)
+  def reverse_geocode(params) do
+    assign(:reverse_geocode, params)
   end
 
-  def reverse_geocode_list(q, opts \\ []) do
-    assign(:reverse_geocode_list, q, opts)
+  def reverse_geocode_list(params) do
+    assign(:reverse_geocode_list, params)
   end
 
   # GenServer API
   @worker_defaults [
     store: Geocoder.Store,
-    provider: Geocoder.Providers.GoogleMaps # or OpenStreetMaps
+    provider: Geocoder.Providers.OpenStreetMaps
   ]
   def init(conf) do
     {:ok, Keyword.merge(@worker_defaults, conf)}
@@ -32,14 +32,21 @@ defmodule Geocoder.Worker do
     GenServer.start_link(__MODULE__, conf)
   end
 
-  def handle_call({function, q, opts}, _from, conf) do
-    {:reply, run(function, q, conf, opts[:store]), conf}
+  def handle_call({function, params}, _from, conf) do
+    # unfortunately, both the worker and param defaults use `store`
+    # for the worker, this defines which store to use, for the params
+    # this defines if the store should be used
+    use_store = params[:store]
+
+    params = Keyword.merge(conf, Keyword.drop(params, [:store]))
+    {:reply, run(function, params, use_store), conf}
   end
 
-  def handle_cast({function, q, opts}, conf) do
-    Task.start_link fn ->
-      send(opts[:stream_to], run(function, conf, q, opts[:store]))
-    end
+  def handle_cast({function, params}, conf) do
+    Task.start_link(fn ->
+      send(params[:stream_to], run(function, params, params[:store]))
+    end)
+
     {:noreply, conf}
   end
 
@@ -50,35 +57,38 @@ defmodule Geocoder.Worker do
     store: true
   ]
 
-  defp assign(name, q, opts) do
-    opts = Keyword.merge(@assign_defaults, opts)
+  defp assign(name, params) do
+    gen_server_options = Keyword.merge(@assign_defaults, params)
+    params_with_defaults = Keyword.drop(gen_server_options, [:timeout, :stream_to])
 
-    function = case {opts[:stream_to], {name, q, opts}} do
-      {nil, message} -> &GenServer.call(&1, message, opts[:timeout])
-      {_,   message} -> &GenServer.cast(&1, message)
-    end
+    function =
+      case {gen_server_options[:stream_to], {name, params_with_defaults}} do
+        {nil, message} -> &GenServer.call(&1, message, gen_server_options[:timeout])
+        {_, message} -> &GenServer.cast(&1, message)
+      end
 
-    :poolboy.transaction(Geocoder.pool_name, function, opts[:timeout])
+    :poolboy.transaction(Geocoder.pool_name(), function, gen_server_options[:timeout])
   end
 
-  defp run(function, q, conf, _) when function == :geocode_list or function == :reverse_geocode_list do
-    apply(conf[:provider], function, [additionnal_conf(q, conf)])
+  def run(function, params, useStore)
+
+  def run(function, params, _) when function in [:geocode_list, :reverse_geocode_list] do
+    apply(params[:provider], function, [params])
   end
-  defp run(function, conf, q, false) do
-    apply(conf[:provider], function, [additionnal_conf(q, conf)])
-    |> tap(&conf[:store].update/1)
-    |> tap(&conf[:store].link(q, &1))
+
+  def run(function, params, false) do
+    apply(params[:provider], function, [params])
+    |> tap(&params[:store].update/1)
+    |> tap(&params[:store].link(params, &1))
   end
-  defp run(function, q, conf, true) do
-    case apply(conf[:store], function, [additionnal_conf(q, conf)]) do
+
+  def run(function, params, true) do
+    case apply(params[:store], function, [params]) do
       {:just, coords} ->
         ok(coords)
-      :nothing ->
-        run(function, conf, q, false)
-    end
-  end
 
-  defp additionnal_conf(q, conf) do
-    Keyword.merge(q, Keyword.drop(conf, [:store, :provider]))
+      :nothing ->
+        run(function, params, false)
+    end
   end
 end
